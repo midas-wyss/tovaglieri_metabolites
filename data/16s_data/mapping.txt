@@ -1,0 +1,1 @@
+#SampleID	region_1	Type	Day	Reactor	Period	sample_type	readsMSQ4.AG.009	V4	Mouse	D1	Control	Stabilisation2	Fermenter	32744CL.12	V4	Human	D8	TR3	Stabilisation2	Fermenter	77281CL.8	V4	Human	D8	TR1	Stabilisation2	Fermenter	85822

@@ -1,0 +1,1217 @@
+---
+title: "RNA-seq and metabolomics on EHEC infection model"
+author:
+- Diogo M. Camacho
+- Alessio Tovaglieri
+date: "May 30, 2018"
+output:
+  slidy_presentation:
+    df_print: paged
+    incremental: no
+  beamer_presentation:
+    incremental: no
+institute: Wyss Institute
+---
+
+```{r setup, include = FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# bioconductor libraries
+library(GO.db)
+library(reactome.db)
+library(DESeq2)
+library(limma)
+library(org.EcK12.eg.db)
+
+# other libraries
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library(gplots)
+library(RColorBrewer)
+library(readxl)
+library(pcaMethods)
+library(ggdendro)
+library(ape)
+library(Rtsne)
+library(corrplot)
+library(gridExtra)
+
+# some functions
+source("R/enrichment_functions.R")
+source("R/tfidf.R")
+
+```
+
+## Experimental data
+
+- Multi-omics data collected for Human Gut-Chip
+- Multiple conditions
+
+## Transcriptomics
+```{r transcriptomics_processing}
+# rna-seq data 
+load(file = "data/ecoli-centric_dual_rnaseq_05162018.RData") # <-- ecoli centric data
+load(file = "data/ehec_annotations_kegg_05292018.RData") # <-- kegg based annotations
+
+samples <- ec_data[[3]]
+bacteria_counts <- as.matrix(ec_data[[1]])
+bacteria_genes <- ec_data[[2]]
+
+ece_genes <- ece_kegg[[1]]
+ece_pathways <- ece_kegg[[2]]
+ece_modules <- ece_kegg[[3]]
+
+gene_annotation <- vector(mode="list",length = nrow(bacteria_genes))
+for(i in seq(1,nrow(bacteria_genes))) {
+  x1 <- which(ece_genes$gene_id == bacteria_genes$id[i])
+  
+  if(length(x1) != 0) {
+    a1 <- ece_genes$gene_name[x1]
+    a2 <- ece_genes$gene_description[x1]
+  } else {
+    a1 <- NA
+    a2 <- NA
+  }
+  gene_annotation[[i]] <- data_frame(gene_id = bacteria_genes$id[i],
+                                     gene_name = a1,
+                                     gene_description = a2)
+}
+gene_annotation <- bind_rows(gene_annotation)
+
+# filter out genes for which we have no gene name
+nix <- which(is.na(gene_annotation$gene_name))
+bacteria_counts <- bacteria_counts[-nix, ]
+bacteria_genes <- gene_annotation[-nix, ]
+
+# remove genes with zero counts
+nix <- which(rowSums(bacteria_counts) == 0)
+
+if(length(nix) != 0)
+{
+  bacteria_counts <- bacteria_counts[-nix, ]
+  bacteria_genes <- bacteria_genes[-nix, ]
+  gene_annotation <- gene_annotation[-nix, ]
+}
+```
+1. Mapping data to EHEC
+    - used `KEGGREST` package in `R` to map IDs to genes
+2. Filtering
+    - removed genes with 0 read counts across *all* experiments
+
+This resulted in `r nrow(bacteria_genes)` genes for further analyses.
+
+## How good are the samples?
+Based on Pearson correlation, are replicates "replicating"?
+
+```{r correlation_plot, echo = FALSE, fig.align= "center"}
+corrplot(cor(bacteria_counts,method = "pearson"),type = "lower",outline = FALSE, tl.col = "black", tl.pos = "l")
+```
+
+## t-SNE plots on samples
+
+```{r tsne_txp, echo = FALSE, fig.align= "center"}
+# all samples
+x <- Rtsne(X = t(scale(bacteria_counts)),perplexity = 5)
+tsne1 <- data_frame(sample_group=samples$Group,
+                         var1=x$Y[,1],
+                         var2=x$Y[,2])
+
+p1 <- tsne1 %>% 
+  ggplot(aes(x=var1,y=var2)) + 
+  geom_point(aes(color=sample_group),size=4) +
+  labs(x="t-SNE 1",y="t-SNE 2", title = "All samples") +
+  theme_bw() + 
+  theme(axis.title = element_text(size=20,face="bold",color="black"),
+        axis.text = element_blank(),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        title = element_text(size = 20, face = "bold"))
+
+# all samples
+# remove no treatment samples
+tsne2 <- tsne1[-c(1:4,12:15),]
+
+tsne2 <- tsne2 %>% add_column(.,color = c(rep("gray",4),rep("darkblue",3),rep("gray",4),rep("red",3)))
+
+p2 <- tsne2 %>% 
+  ggplot(aes(x=var1,y=var2)) + 
+  # geom_point(aes(color=sample_group),size=4) +
+  geom_point(aes(color=color),size=4) +
+  scale_color_identity() +
+  labs(x="t-SNE 1",y="t-SNE 2", title = "Treated samples") +
+  theme_bw() + 
+  theme(axis.title = element_text(size=20,face="bold",color="black"),
+        axis.text = element_blank(),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        title = element_text(size = 20, face = "bold"))
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+## Differential expression analyses
+```{r deseq2, echo = FALSE, include = FALSE}
+# DESeq2 ----
+# E. coli
+dds <- DESeqDataSetFromMatrix(countData = bacteria_counts[,c(9,10,11,20,21,22)],
+                              colData = samples[c(9,10,11,20,21,22),],
+                              design = ~ Group)
+
+dds <- DESeq(object = dds)
+
+# ec_e_ab_res <- results(dds,contrast=c("Group","H_E_AB","M_E_AB"),alpha=0.05,lfcThreshold = 1)
+ec_fb_res <- results(dds, 
+                     contrast = c("Group", "H_FB", "M_FB"),
+                     pAdjustMethod = "fdr",
+                     cooksCutoff = FALSE)
+
+ec_fb_res <- data_frame(gene_symbol = bacteria_genes$gene_name,
+                        logFC = as.vector(as.numeric(ec_fb_res$log2FoldChange)),
+                        p_val = as.vector(as.numeric(ec_fb_res$pvalue)),
+                        q_val = as.vector(as.numeric(ec_fb_res$padj)))
+
+diff_genes <- ec_fb_res %>% dplyr::filter(.,q_val < 0.05)
+```
+
+- Ran `DESeq2` to compute differential expression of floating bacteria, in human microbial metabolites versus murine microbial metabolites;
+- Identified `r nrow(diff_genes)` differentially expressed (q < 0.05), split between `r diff_genes %>% dplyr::filter(., logFC > 1) %>% nrow` up-regulated genes and `r diff_genes %>% dplyr::filter(., logFC < -1) %>% nrow` down-regulated genes (fold change > 2).
+
+## Pathway enrichment on differentially expressed genes
+
+- Thresholded genes based on FDR q-value only;
+- Enrichment ran against: GO Biological Process gene sets (K12 gene sets), KEGG pathway gene sets (EHEC specific), KEGG module gene sets (EHEC specific)
+
+```{r pathway_enrichments, echo = FALSE, include = FALSE}
+# enrichment based on tf-idf enrichments (a hack for now)
+# KEGG ENRICHMENTS ----
+# build pathway matrix and module matrix
+upath <- unique(ece_pathways$pathway_id)
+upg <- unique(ece_pathways$gene_id)
+umod <- unique(ece_modules$module_id)
+umg <- unique(ece_modules$gene_id)
+
+pathway_mat <- matrix(0, ncol = length(upg), nrow = length(upath))
+module_mat <- matrix(0, ncol = length(umg), nrow = length(umod))
+
+for(i in seq(1, nrow(pathway_mat))) {
+  x1 <- which(upg %in% ece_pathways$gene_id[ece_pathways$pathway_id == upath[i]])
+  pathway_mat[i, x1] <- 1
+}
+colnames(pathway_mat) <- ece_genes$gene_name[which(ece_genes$gene_id %in% upg)]
+rownames(pathway_mat) <- ece_pathways$pathway_name[match(upath,ece_pathways$pathway_id)]
+
+for(i in seq(1, nrow(module_mat))) {
+  x1 <- which(umg %in% ece_modules$gene_id[ece_modules$module_id == umod[i]])
+  module_mat[i, x1] <- 1
+}
+colnames(module_mat) <- ece_genes$gene_name[which(ece_genes$gene_id %in% umg)]
+rownames(module_mat) <- ece_modules$module_name[match(umod,ece_modules$module_id)]
+
+# tfidf enrichment using these sets
+pathway_tfidf <- tfidf(data_matrix = Matrix::Matrix(data = pathway_mat, sparse=TRUE))
+kegg_path_cpm <- crossprod_matrix(tfidf_matrix = pathway_tfidf)
+
+module_tfidf <- tfidf(data_matrix = Matrix(module_mat, sparse=TRUE))
+kegg_mod_cpm <- crossprod_matrix(tfidf_matrix = module_tfidf)
+
+
+# GO ENRICHMENT ----
+go2gene <- AnnotationDbi::select(x=org.EcK12.eg.db,
+                                 keys = bacteria_genes$gene_name,
+                                 keytype = "SYMBOL",
+                                 columns = c("GO","ONTOLOGY","GENENAME","PATH"))
+
+tmp <- go2gene %>% dplyr::filter(.,!is.na(GO) & ONTOLOGY == "BP")
+ugo <- unique(tmp$GO)
+ugene <- unique(tmp$SYMBOL)
+
+gobp_table <- matrix(0,nrow = length(ugo),ncol = length(ugene))
+for(i in seq(1,nrow(gobp_table))) {
+  x1 <- which(tmp$GO == ugo[i])
+  x2 <- tmp$SYMBOL[x1]
+  x3 <- which(ugene %in% x2)
+  gobp_table[i,x3] <- 1
+}
+
+colnames(gobp_table) <- ugene
+rownames(gobp_table) <- ugo
+
+y1 <- AnnotationDbi::select(x=GO.db,keys = ugo,keytype = "GOID",columns = c("TERM","DEFINITION"))
+
+gobp <- data_frame(goid = ugo,
+                   go_term = y1$TERM,
+                   go_description = y1$DEFINITION)
+
+gobp_tfidf <- tfidf(data_matrix = Matrix(gobp_table, sparse = TRUE))
+gobp_cpm <- crossprod_matrix(tfidf_matrix = gobp_tfidf)
+
+
+# ENRICHMENT BIT ----
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+# GO first
+query_vector <- matrix(0, ncol = ncol(gobp_tfidf), nrow = 1)
+query_vector[which(colnames(gobp_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000, universe_size = ncol(gobp_tfidf), gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset, target_tfidf = gobp_tfidf, tfidf_crossprod_mat = gobp_cpm)
+rnd_res <- lapply(rnd_res, as.matrix)
+rnd_res <- do.call(cbind, rnd_res)
+gobp_similarities <- cosine_similarity(x = gobp_tfidf, y = query_vector, tfidf_crossprod_mat = gobp_cpm)
+go_enr <- data_frame(go_id = rownames(gobp_tfidf),
+                  go_term = gobp$go_term[match(rownames(gobp_tfidf),gobp$goid)],
+                  cosine_similarity = as.vector(gobp_similarities),
+                  number_genes_pathway = rowSums(gobp_table[match(rownames(gobp_tfidf),gobp$goid),]))
+go_enr$probability_random <- 1 - res_stats(go_enr$cosine_similarity,rnd_res)
+# go_enr$score <- as.vector((gobp_similarities / max(gobp_similarities))  - log10(go_enr$probability_random) + 1)
+# go_enr$score[go_enr$probability_random == 0] <- (gobp_similarities[go_enr$probability_random == 0] / max(gobp_similarities)) - log10(1 / nrow(rset)) + 1
+
+go_enr_plot <- go_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.01) %>%
+  # dplyr::arrange(.,desc(score)) %>%
+  dplyr::arrange(., desc(cosine_similarity)) %>%
+  dplyr::slice(1:20) %>%
+  ggplot() + 
+  geom_point(aes(x = reorder(go_term, cosine_similarity), y = cosine_similarity)) +
+  labs(x = "GO Biological Process", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"),
+        legend.position = "none")
+
+# KEGG pathways
+query_vector <- matrix(0,ncol=ncol(pathway_tfidf),nrow = 1)
+query_vector[which(colnames(pathway_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(pathway_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = pathway_tfidf,tfidf_crossprod_mat = kegg_path_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+pathway_similarities <- cosine_similarity(x = pathway_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_path_cpm)
+kegg_path_enr <- data_frame(pathway = rownames(pathway_tfidf),cosine_similarity = as.vector(pathway_similarities))
+kegg_path_enr$probability_random <- 1 - res_stats(kegg_path_enr$cosine_similarity,rnd_res)
+kp_plot <- kegg_path_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(pathway,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "KEGG Pathway", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"))
+
+# KEGG modules
+query_vector <- matrix(0,ncol=ncol(module_tfidf),nrow = 1)
+query_vector[which(colnames(module_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(module_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = module_tfidf,tfidf_crossprod_mat = kegg_mod_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+module_similarities <- cosine_similarity(x = module_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_mod_cpm)
+kegg_mod_enr <- data_frame(pathway = rownames(module_tfidf),cosine_similarity = as.vector(module_similarities))
+kegg_mod_enr$probability_random <- 1 - res_stats(kegg_mod_enr$cosine_similarity,rnd_res)
+km_plot <- kegg_mod_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(pathway,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "KEGG Module", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"))
+```
+
+## Pathway enrichments: GO terms
+```{r go_enr_plot, fig.align= "center"}
+go_enr_plot
+```
+
+## Pathway enrichments: KEGG pathways
+```{r kegg_pathway_enr, fig.align= "center"}
+kp_plot
+```
+
+## Pathway enrichments: KEGG modules
+```{r kegg_module_enr, fig.align= "center"}
+km_plot
+```
+
+## Gene set specific heatmaps: Chemotaxis
+```{r filter_enrichments, include=FALSE, echo = FALSE}
+tmp1 <- go_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20)
+
+tmp2 <- kegg_path_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20)
+
+tmp3 <- kegg_mod_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20)
+
+
+g1 <- intersect(names(which(gobp_table[which(rownames(gobp_table) == tmp1$go_id[8]),] == 1)), diff_genes)
+g2 <- intersect(names(which(pathway_mat[which(rownames(pathway_mat) == tmp2$pathway[2]),] == 1)), diff_genes)
+g3 <- intersect(names(which(module_mat[which(rownames(module_mat) == tmp3$pathway[3]),] == 1)), diff_genes)
+```
+
+```{r heatmap_chemotaxis,fig.align="center"}
+# heatmap
+my_palette <- colorRampPalette(c("white","moccasin","red3","red4"))(n = 20)
+
+heatmap.2(bacteria_counts[which(bacteria_genes$gene_name %in% g1),c(9,10,11,20,21,22)],
+          scale = "row",
+          trace = "none",
+          density.info = "none",dendrogram = "row",
+          Colv = NA,
+          labCol = c("H","H","H","M","M","M"), col = my_palette,
+          labRow = bacteria_genes$gene_name[which(bacteria_genes$gene_name %in% g1)])
+```
+
+## Gene set specific heatmaps: KEGG module Pathogenic E. coli infection
+```{r heatmap_kegg_pathway, fig.align= "center"}
+heatmap.2(bacteria_counts[which(bacteria_genes$gene_name %in% g2),c(9,10,11,20,21,22)], 
+          scale = "row", 
+          trace = "none", 
+          density.info = "none",dendrogram = "row",
+          Colv = NA, 
+          labCol = c("H","H","H","M","M","M"), col = my_palette,
+          labRow = bacteria_genes$gene_name[which(bacteria_genes$gene_name %in% g2)])
+```
+
+## Gene set specific heatmaps: KEGG module Type III secretion system
+```{r heatmap_kegg_module, fig.align= "center"}
+heatmap.2(bacteria_counts[which(bacteria_genes$gene_name %in% g3),c(9,10,11,20,21,22)], 
+          scale = "row", 
+          trace = "none", 
+          density.info = "none", dendrogram = "row", col = my_palette,
+          Colv = NA, 
+          labCol = c("H","H","H","M","M","M"), 
+          labRow = bacteria_genes$gene_name[which(bacteria_genes$gene_name %in% g3)])
+```
+
+## Enrichment of up or down regulated independently
+```{r enrichment_separate, echo = FALSE}
+# ENRICHMENT BIT ----
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC > 0) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+# GO up
+query_vector <- matrix(0,ncol=ncol(gobp_tfidf),nrow = 1)
+query_vector[which(colnames(gobp_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(gobp_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = gobp_tfidf,tfidf_crossprod_mat = gobp_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+gobp_similarities <- cosine_similarity(x = gobp_tfidf,y = query_vector,tfidf_crossprod_mat = gobp_cpm)
+go_enr_up <- data_frame(go_id = rownames(gobp_tfidf),
+                  go_term = gobp$go_term[match(rownames(gobp_tfidf),gobp$goid)],
+                  cosine_similarity = as.vector(gobp_similarities),
+                  number_genes_pathway = rowSums(gobp_table[match(rownames(gobp_tfidf),gobp$goid),]))
+go_enr_up$probability_random <- 1 - res_stats(go_enr_up$cosine_similarity,rnd_res)
+
+go_enr_up <- go_enr_up %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05 & number_genes_pathway > 3) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+
+# GO down
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC < 0) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+query_vector <- matrix(0,ncol=ncol(gobp_tfidf),nrow = 1)
+query_vector[which(colnames(gobp_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(gobp_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = gobp_tfidf,tfidf_crossprod_mat = gobp_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+gobp_similarities <- cosine_similarity(x = gobp_tfidf,y = query_vector,tfidf_crossprod_mat = gobp_cpm)
+go_enr_down <- data_frame(go_id = rownames(gobp_tfidf),
+                  go_term = gobp$go_term[match(rownames(gobp_tfidf),gobp$goid)],
+                  cosine_similarity = as.vector(gobp_similarities),
+                  number_genes_pathway = rowSums(gobp_table[match(rownames(gobp_tfidf),gobp$goid),]))
+go_enr_down$probability_random <- 1 - res_stats(go_enr_down$cosine_similarity,rnd_res)
+
+go_enr_down <- go_enr_down %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05 & number_genes_pathway > 3) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+go_separate <- go_enr_down %>% 
+  mutate(., cosine_similarity = cosine_similarity * -1) %>% 
+  bind_rows(.,go_enr_up) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(go_term,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "GO Biological Process", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"),
+        legend.position = "none")
+
+# KEGG pathways up
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC > 1) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+query_vector <- matrix(0,ncol=ncol(pathway_tfidf),nrow = 1)
+query_vector[which(colnames(pathway_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(pathway_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = pathway_tfidf,tfidf_crossprod_mat = kegg_path_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+pathway_similarities <- cosine_similarity(x = pathway_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_path_cpm)
+kp_up <- data_frame(pathway = rownames(pathway_tfidf),cosine_similarity = as.vector(pathway_similarities))
+kp_up$probability_random <- 1 - res_stats(kp_up$cosine_similarity,rnd_res)
+
+# KEGG pathways down
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC < -1) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+query_vector <- matrix(0,ncol=ncol(pathway_tfidf),nrow = 1)
+query_vector[which(colnames(pathway_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(pathway_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = pathway_tfidf,tfidf_crossprod_mat = kegg_path_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+pathway_similarities <- cosine_similarity(x = pathway_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_path_cpm)
+kp_down <- data_frame(pathway = rownames(pathway_tfidf),cosine_similarity = as.vector(pathway_similarities))
+kp_down$probability_random <- 1 - res_stats(kp_down$cosine_similarity,rnd_res)
+
+kp_plot <- kegg_path_enr %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:20) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(pathway,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "KEGG Pathway", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"))
+
+kp_up <- kp_up %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+kp_down <- kp_down %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+kp_separate <- kp_down %>% 
+  mutate(., cosine_similarity = cosine_similarity * -1) %>% 
+  bind_rows(.,kp_up) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(pathway,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "KEGG Pathway", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"),
+        legend.position = "none")
+
+kp_separate
+```
+
+
+
+## Gene set for top up and down regulated KEGG pathway
+```{r heatmap_kegg_separate, fig.align= "center"}
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC > 1 | logFC < -1) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+g2 <- c(intersect(names(which(pathway_mat[which(rownames(pathway_mat) == kp_up$pathway[1]),] == 1)),diff_genes),
+        intersect(names(which(pathway_mat[which(rownames(pathway_mat) == kp_down$pathway[1]),] == 1)),diff_genes))
+
+heatmap.2(bacteria_counts[which(bacteria_genes$gene_name %in% g2),c(9,10,11,20,21,22)], 
+          scale = "row", 
+          trace = "none", 
+          density.info = "none",dendrogram = "row",
+          Colv = NA, 
+          labCol = c("H","H","H","M","M","M"), col = my_palette,
+          labRow = bacteria_genes$gene_name[which(bacteria_genes$gene_name %in% g2)])
+```
+
+
+
+<!---- METABOLOMICS ---->
+## KEGG Modules add aditional layer of biological understanding
+```{r kegg_modules_seprate,fig.align="center"}
+# KEGG pathways up
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC > 1) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+query_vector <- matrix(0,ncol=ncol(module_tfidf),nrow = 1)
+query_vector[which(colnames(module_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(module_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = module_tfidf,tfidf_crossprod_mat = kegg_mod_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+pathway_similarities <- cosine_similarity(x = module_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_mod_cpm)
+km_up <- data_frame(pathway = rownames(module_tfidf),cosine_similarity = as.vector(pathway_similarities))
+km_up$probability_random <- 1 - res_stats(km_up$cosine_similarity,rnd_res)
+
+# KEGG pathways down
+diff_genes <- ec_fb_res %>% 
+  dplyr::filter(., q_val < 0.05 & logFC < -1) %>% 
+  dplyr::select(., gene_symbol) %>%
+  as.matrix
+
+query_vector <- matrix(0,ncol=ncol(module_tfidf),nrow = 1)
+query_vector[which(colnames(module_tfidf) %in% diff_genes)] <- 1
+rset <- random_sets(number_sets = 10000,universe_size = ncol(module_tfidf),gene_set_size = length(diff_genes))
+rnd_res <- random_tfidf(random_set = rset,target_tfidf = module_tfidf,tfidf_crossprod_mat = kegg_mod_cpm)
+rnd_res <- lapply(rnd_res,as.matrix)
+rnd_res <- do.call(cbind,rnd_res)
+pathway_similarities <- cosine_similarity(x = module_tfidf,y = query_vector,tfidf_crossprod_mat = kegg_mod_cpm)
+km_down <- data_frame(pathway = rownames(module_tfidf),cosine_similarity = as.vector(pathway_similarities))
+km_down$probability_random <- 1 - res_stats(km_down$cosine_similarity,rnd_res)
+
+km_up <- km_up %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+km_down <- km_down %>% 
+  dplyr::filter(.,cosine_similarity != 0 & probability_random < 0.05) %>%
+  dplyr::arrange(.,desc(cosine_similarity)) %>%
+  dplyr::slice(1:10)
+
+km_separate <- km_down %>% 
+  mutate(., cosine_similarity = cosine_similarity * -1) %>% 
+  bind_rows(.,km_up) %>%
+  ggplot() + 
+  geom_point(aes(x=reorder(pathway,cosine_similarity),y=cosine_similarity)) +
+  labs(x = "KEGG Module", y = "Similarity") +
+  coord_flip() + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 20, face = "bold", color = "black"),
+        legend.position = "none")
+
+km_separate
+```
+
+## Intermission
+- Gene expression signatures for EHEC in contact with mouse microbial or human microbial metabolites may give hint into tolerance mechanism
+    <!-- - Bacteria are more aggressive/pathogenic in human microbial metabolite composition -->
+    <!-- - Bacteria are stickier and talk more (chemotaxis and quorum sensing results) -->
+    <!-- - Hints for treatment? Metabolomics data for part 2.  -->
+```{r kegg_pathway_separate, fig.align="center"}
+kp_separate
+```
+    
+    
+## Metabolomics data
+```{r metabolomics_data, include = FALSE, echo = FALSE}
+# load data ---
+# metabolomics data
+metabolomics_data <- read.csv("/Volumes/THoR/omics/data/human_chips/metabolomics/microbiota_metabolites/metabolomics_data_fas_02212018.csv",header=TRUE)
+cpd_data <- metabolomics_data[,seq(1,23)]
+metabolomics_area <- metabolomics_data[,-seq(1,23)]
+metabolomics_area <- apply(metabolomics_area,2,as.numeric)
+
+# SAMPLE DATA 
+groups <- c(rep("AP_Hmb_EHEC",5),
+            rep("AP_Hmb",3),
+            rep("AP_Mmb_EHEC",5),
+            rep("AP_Mmb",3),
+            rep("M-Disb-mb_stock_100",3),
+            rep("BL_Hmb_EHEC",5),
+            rep("BL_Hmb",3),
+            rep("BL_Mmb_EHEC",5),
+            rep("BL_Mmb",3),
+            rep("Hmb_stock_100",3),
+            rep("Mmb_stock_100",3),
+            "AP_Hmb_stock_5_ctrl",	
+            "AP_Mmb_stock_5_ctrl",
+            "Hmb_pre-fermentation_100",
+            "Mmb_pre-fermentation_100",
+            "BL_medium_ctrl",
+            rep("M-Eub-mb_stock_100",3))		
+
+sample <- colnames(metabolomics_area)
+
+metabolomics_df <- data_frame(group=groups,
+                              sample_name=sample)
+
+tmp <- metabolomics_area
+rownames(tmp) <- cpd_data$ref
+tmp <- tmp %>% t %>% as_data_frame(.)
+
+metabolomics_df <- cbind(metabolomics_df,tmp)
+rm(tmp)
+
+
+# NORMALIZATION
+library(preprocessCore)
+# get apical and basal controls
+hs_ap_ctr <- "AP_Hmb_stock_5_ctrl"
+mm_ap_ctr <- "AP_Mmb_stock_5_ctrl"
+bl_ctr <- "BL_medium_ctrl"
+
+# hs_ap_ctr <- "Hmb_stock_100"
+# mm_ap_ctr <- "Mmb_stock_100"
+
+
+# tested groups
+hs_ap_ehec <- "AP_Hmb_EHEC"
+hs_ap <- "AP_Hmb"
+mm_ap_ehec <- "AP_Mmb_EHEC"
+mm_ap <- "AP_Mmb"
+
+bl_hs_ehec <- "BL_Hmb_EHEC"
+bl_hs <- "BL_Hmb"
+bl_mm_ehec <- "BL_Mmb_EHEC"
+bl_mm <- "BL_Mmb"
+
+# get control vector
+# x1 <- metabolomics_area[,which(metabolomics_df$group == hs_ap_ctr)]
+# x2 <- metabolomics_area[,which(metabolomics_df$group == mm_ap_ctr)]
+# x3 <- metabolomics_area[,which(metabolomics_df$group == bl_ctr)]
+
+# quantile normalize 
+norm_data <- normalize.quantiles(x = metabolomics_area[,c(1:16,36:45)],
+                                 copy = TRUE)
+
+norm_data <- log2(norm_data)
+colnames(norm_data) <- colnames(metabolomics_area[,c(1:16,36:45)])
+
+groups <- groups[c(1:16,36:45)]
+
+pd <- data_frame(group = rep(metabolomics_df$group[match(sapply(colnames(norm_data),rep,nrow(norm_data)),metabolomics_df$sample_name)],2),
+                 sample_name = rep(as.vector(sapply(colnames(norm_data),rep,nrow(norm_data))),2),
+                 metabolite = rep(rep(cpd_data$ref,ncol(norm_data)),2),
+                 data_type = c(rep("raw",nrow(norm_data)*ncol(norm_data)),rep("normalized",nrow(norm_data)*ncol(norm_data))),
+                 data = c(as.vector(log2(metabolomics_area[,c(1:16,36:45)])),as.vector(norm_data)))
+```
+
+- Normalized intensities using a quantile normalization (similar to RMA normalization)
+
+```{r metabolomics_normalized_plot, echo = FALSE, fig.align="center"}
+pd %>% 
+  ggplot() + 
+  geom_boxplot(aes(x=group,y=data,fill=data_type)) +
+  labs(x="sample group",y="Metabolite level") +
+  facet_grid(~ data_type) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(size=12,color="black",angle=90,vjust=0.5,hjust=1),
+        axis.title = element_text(size=20,face="bold",color="black"),
+        axis.text.y = element_text(size=12,color="black"))
+```
+
+## How good are these replicates?
+```{r replicate_comparison_metabolomics, fig.align="center"}
+# differential abundance ----
+# comparisons to make
+# 1. hmb/mmb stock 100 to pre-fermentation (pool these) --> this will tell us what EACH MICROBIOME produces
+#   a) extract only the ones that are elevated (ie., produced by either microbiome)
+# 2. for metabolites in group 1a:
+#   a) mouse mm + ehec / mouse mm
+#   b) human mm + ehec / human mm
+# this group will tell us what the infection does to these selected metabolites
+# 3. Assuming dilution won't play a role, compare:
+#   a) mouse mm / mouse mm stock 100
+#   b) human mm / human mm stock 100
+# this will tell us what the epithelial does.  can be cross compared to the groups in 2a
+# 4. 
+
+# first, check if groups are coherent (ie, all samples in group are correlated with correlation > 0.75)
+R <- cor(norm_data)
+colnames(R) <- groups
+corrplot(R, type = "lower", outline = FALSE, tl.col = "black", tl.pos = "l")
+```
+
+- Sample 3313A is not well correlated with its replicate counterparts.  We will discard this sample.
+
+```{r clean_metabolomics_data}
+ugroup <- unique(groups)
+
+keep_sample <- vector(mode = "list",length = length(ugroup))
+for(i in seq_along(ugroup)) {
+  x1 <- which(groups == ugroup[i])
+  if(length(x1) > 1) {
+    x2 <- R[x1,x1]
+    x2[lower.tri(x2)] <- 0
+    diag(x2) <- 0
+    x3 <- length(unique(unlist(apply(x2,1,function(x) which(x > 0.75))))) + 1
+    if(length(x1) == x3) {
+      keep_sample[[i]] <- x1 
+    } else {
+      keep_sample[[i]] <- setdiff(x1,x1[setdiff(which(x2[1,] < 0.75),1)])
+    }  
+  } else {
+    keep_sample[[i]] <- x1
+  }
+}
+
+keep_sample <- unlist(keep_sample)
+nix <- setdiff(seq(1,ncol(norm_data)),keep_sample) # <-- samples to remove
+if(length(nix) != 0) {
+  norm_data <- norm_data[,-nix]
+  groups <- groups[-nix]
+}
+
+ugroup <- unique(groups)
+```
+
+## Subsetting metabolites
+- We will only include metabolites that *increase* their abundance between pre-fermentation state and after microbial metabolites (human or murine) are added.
+    - rationale: these are the metabolites that are *produced* by either the host or the microbiome that will have significance for phenotype
+    
+```{r microbiome_metabolites}
+res1a <- limma_dge(norm_data,
+                  caseIds = which(groups == "Hmb_stock_100"),
+                  ctrIds = grep("fermentation",groups)) # <-- comparison 1a: what human microbiome produces
+
+res1b <- limma_dge(norm_data,
+                  caseIds = which(groups == "Mmb_stock_100"),
+                  ctrIds = grep("fermentation",groups)) # <-- comparison 1b: what mouse microbiome produces
+
+a1 <- which(res1a$logFC > 0 & res1a$adj.P.Val < 0.01)
+a2 <- which(res1b$logFC > 0 & res1b$adj.P.Val < 0.01)
+microbiome_metabolites <- union(a1,a2)
+
+# now subset these
+new_norm_data <- norm_data[microbiome_metabolites, ]
+new_cpd_data <- cpd_data[microbiome_metabolites, ]
+```
+
+## Subseting metabolites: heatmap
+```{r subset_metabolites,fig.align="center"}
+# heatmap for these, only in pre-fermentation and stock
+a1 <- which(groups == "Mmb_pre-fermentation_100")
+a2 <- which(groups == "Hmb_pre-fermentation_100")
+a3 <- which(groups == "Mmb_stock_100")
+a4 <- which(groups == "Hmb_stock_100")
+a5 <- which(groups == "AP_Mmb_stock_5_ctrl")
+a6 <- which(groups == "AP_Hmb_stock_5_ctrl")
+
+mtx_palette <- colorRampPalette(c("white","light blue", "dark blue"))(n = 20)
+
+heatmap.2(new_norm_data[,c(a1,a2,a3,a4,a5,a6)], col = mtx_palette, density.info = "none", trace = "none", scale = "row", labCol = c("Mmb PF","Hmb PF",rep("Mmb stock 100",3),rep("Hmb stock",3),"Mmb stock 5","Hmb stock 5"), labRow = NA, margins = c(10,10))
+```
+
+Found a total of `r length(microbiome_metabolites)` metabolites that increase abundance when exposed to *either* microbiome.
+
+
+## How metabolites change
+- Comparisons to make:
+    - infection effects:
+        - mouse mm + ehec / mouse mm
+        - human mm + ehec / human mm
+    - epithelial cells effect:
+        - mouse mm / mouse mm stock 5
+        - human mm / human mm stock 5
+
+```{r metabolite_comparisons}
+# and make the necessary comparisons
+res2a <- limma_dge(new_norm_data,
+                   caseIds = which(groups == "AP_Mmb_EHEC"),
+                   ctrIds = which(groups == "AP_Mmb")) # <-- comparison 2a: what infection does in mouse metabolites
+
+res2b <- limma_dge(new_norm_data,
+                   caseIds = which(groups == "AP_Hmb_EHEC"),
+                   ctrIds = which(groups == "AP_Hmb")) # <-- comparison 2b: what infection does in human metabolites
+
+res3a <- limma_dge(new_norm_data,
+                   caseIds = which(groups == "AP_Mmb"),
+                   ctrIds = which(groups == "AP_Mmb_stock_5_ctrl")) # <-- comparison 3a: how mouse metabolites change between input and output
+
+res3b <- limma_dge(new_norm_data,
+                   caseIds = which(groups == "AP_Hmb"),
+                   ctrIds = which(groups == "AP_Hmb_stock_5_ctrl")) # <-- comparison 3b: how human metabolites change between input and output
+
+```
+
+## Infection metabolites
+- Looking at metabolites that show opposite changes in human or mouse microbial metabolites:
+    - `r length(which(res2a$adj.P.Val < 0.05))` metabolites differentially abundant in mouse (q < 0.05)
+    - `r length(which(res2b$adj.P.Val < 0.05))` metabolites differentially abundant in human (q < 0.05)
+    - `r length(intersect(which(with(res2b,logFC > 0 & adj.P.Val < 0.05)),which(res2a$logFC < 0)))` metabolites that are are high in human but low in mouse
+    - `r length(intersect(which(with(res2b,logFC < 0 & adj.P.Val < 0.05)),which(res2a$logFC > 0)))` metabolites that are are low in human but high in mouse
+    - `r length(intersect(which(with(res2a,logFC > 0 & adj.P.Val < 0.05)),which(res2b$logFC < 0)))` metabolites that are are high in mouse but low in human
+    - `r length(intersect(which(with(res2a,logFC < 0 & adj.P.Val < 0.05)),which(res2b$logFC > 0)))` metabolites that are are low in mouse but high in human
+    
+    
+## Mouse metabolites in infection
+```{r mouse_high,fig.align="center"}
+x1 <- which(res2a$adj.P.Val < 0.05)
+
+# metabolite data frame
+row_scaled_data <- as.vector(t(scale(t(new_norm_data))))
+group_replicate <- c(1,2,3,4,5,1,2,3,1,2,3,4,1,2,3,1,2,3,1,2,3,1,1,1,1)
+y1 <- cbind(as.matrix(groups),group_replicate)
+y1 <- apply(y1,1,paste,collapse="-")
+
+met_df <- data_frame(metabolite_id = rep(new_cpd_data$ref,ncol(new_norm_data)),
+                     sample = as.vector(unlist(sapply(colnames(new_norm_data),rep,nrow(new_norm_data)))),
+                     group_name = as.vector(unlist(sapply(groups,rep,nrow(new_norm_data)))),
+                     plot_label = as.vector(unlist(sapply(y1,rep,nrow(new_norm_data)))),
+                     data = row_scaled_data)
+
+# met_df %>% 
+#   dplyr::filter(., group_name == "AP_Mmb_EHEC" | group_name == "AP_Mmb") %>% #| group_name == "AP_Hmb_EHEC" | group_name == "AP_Hmb") %>%
+#   dplyr::filter(., metabolite_id %in% new_cpd_data$ref[x1]) %>%
+#   ggplot(aes(x = plot_label, y = metabolite_id)) + 
+#   # geom_density_ridges() + 
+#   geom_tile(aes(fill = data), color = "white") +
+#   coord_equal() +
+#   # facet_grid(~ group_name) +
+#   # geom_violin(aes(fill = group_name)) + 
+#   theme_bw() + 
+#   theme(axis.text.y = element_text(),
+#         axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),
+#         axis.ticks = element_blank())
+
+a1 <- which(groups == "AP_Mmb_EHEC")
+a2 <- which(groups == "AP_Mmb")
+
+mtx_palette <- colorRampPalette(c("white","light blue", "dark blue"))(n = 20)
+
+heatmap.2(new_norm_data[x1,c(a1,a2)], col = mtx_palette, density.info = "none", trace = "none", scale = "row", Colv = NA, dendrogram = "row", labCol = c(rep("Mmb + EHEC",4),rep("Mmb",3)), labRow = new_cpd_data$ref[x1], margins = c(12,12))
+
+```
+
+## Human metabolites in infection
+```{r human_high, fig.align="center"}
+x1 <- which(res2b$adj.P.Val < 0.05)
+
+a1 <- which(groups == "AP_Hmb_EHEC")
+a2 <- which(groups == "AP_Hmb")
+
+mtx_palette <- colorRampPalette(c("white","light blue", "dark blue"))(n = 20)
+
+heatmap.2(new_norm_data[x1,c(a1,a2)], col = mtx_palette, density.info = "none", trace = "none", scale = "row", Colv = NA, dendrogram = "row", labCol = c(rep("Hmb + EHEC",length(a1)),rep("Hmb",length(a2))), labRow = new_cpd_data$ref[x1], margins = c(10,10))
+```
+
+
+## Combined
+```{r mouse_human, fig.align="center"}
+x3 <- c(which(res2a$adj.P.Val < 0.05),
+        which(res2b$adj.P.Val < 0.05))#,
+        # which(res3a$adj.P.Val < 0.05),
+        # which(res3b$adj.P.Val < 0.05))
+
+# metabolite data frame
+row_scaled_data <- as.vector(t(scale(t(new_norm_data))))
+group_replicate <- c(1,2,3,4,5,1,2,3,1,2,3,4,1,2,3,1,2,3,1,2,3,1,1,1,1)
+y1 <- cbind(as.matrix(groups),group_replicate)
+y1 <- apply(y1,1,paste,collapse="-")
+
+# cluster
+tmp_data <- t(scale(t(norm_data[x3, ])))
+rownames(tmp_data) <- new_cpd_data$ref[x3]
+
+d <- dist(x = tmp_data, method = "euclidean")
+hc <- hclust(d, method = "complete")
+
+met_df <- data_frame(metabolite_id = rep(new_cpd_data$ref,ncol(new_norm_data)),
+                     sample = as.vector(unlist(sapply(colnames(new_norm_data),rep,nrow(new_norm_data)))),
+                     group_name = as.vector(unlist(sapply(groups,rep,nrow(new_norm_data)))),
+                     plot_label = as.vector(unlist(sapply(y1,rep,nrow(new_norm_data)))),
+                     data = row_scaled_data)
+
+met_df %>%
+  dplyr::filter(., group_name == "AP_Mmb_EHEC" | group_name == "AP_Mmb" | group_name == "AP_Hmb_EHEC" | group_name == "AP_Hmb") %>%
+  dplyr::filter(., metabolite_id %in% new_cpd_data$ref[x3]) %>%
+  ggplot(aes(x = plot_label, y = metabolite_id)) +
+  geom_tile(aes(fill = data), color = "white") +
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "red") +
+  coord_equal() +
+  # facet_grid(~ group_name) +
+  # geom_violin(aes(fill = group_name)) +
+  theme_bw() +
+  theme(axis.text.y = element_text(),
+        axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),
+        axis.ticks = element_blank())
+
+a1 <- which(groups == "AP_Mmb_EHEC")
+a2 <- which(groups == "AP_Mmb")
+a3 <- which(groups == "AP_Hmb_EHEC")
+a4 <- which(groups == "AP_Hmb")
+
+mtx_palette <- colorRampPalette(c("white","light blue", "dark blue"))(n = 20)
+
+heatmap.2(x = new_norm_data[x3, c(a1, a2, a3, a4)], 
+          col = mtx_palette, 
+          density.info = "none", 
+          trace = "none", 
+          scale = "row", 
+          Colv = NA, 
+          dendrogram = "row", 
+          labCol = c(rep("Mmb + EHEC", length(a1)), 
+                     rep("Mmb", length(a2)), 
+                     rep("Hmb + EHEC", length(a3)), 
+                     rep("Hmb", length(a4))), 
+          labRow = new_cpd_data$ref[x3], 
+          margins = c(12,12))
+```
+
+## Interesting behavior metabolites
+```{r interesting_behavior}
+# produced by ehec
+x1 <- new_cpd_data$ref[res2a$adj.P.Val < 0.05 & res2a$logFC > 0] # <-- up in mouse
+x2 <- new_cpd_data$ref[res2b$logFC > 0] # <-- up in human (not necessarily diff abundant)
+x3 <- new_cpd_data$ref[res2b$logFC < 0] # <-- down in human (not necessarily diff abundant)
+
+y1 <- new_cpd_data$ref[res2b$adj.P.Val < 0.05 & res2b$logFC > 0] # <-- up in human
+y2 <- new_cpd_data$ref[res2a$logFC > 0] # <-- up in mouse (not necessarily diff abundant)
+y3 <- new_cpd_data$ref[res2a$logFC < 0] # <-- down in mouse (not necessarily diff abundant)
+
+z1 <- c(intersect(x1, x2), intersect(y1, y2))
+
+# involved in tolerance?
+x1 <- new_cpd_data$ref[res2a$adj.P.Val < 0.05 & res2a$logFC > 0] # <-- diff in mouse
+x3 <- new_cpd_data$ref[res2b$logFC < 0] # <-- down in human (not necessarily diff abundant)
+
+y1 <- new_cpd_data$ref[res2b$adj.P.Val < 0.05 & res2b$logFC < 0] # <-- diff in human
+y2 <- new_cpd_data$ref[res2a$logFC > 0] # <-- up in mouse (not necessarily diff abundant)
+
+z2 <- c(intersect(x1, x3), 
+        intersect(y1, y2))
+
+```
+
+## Genes and metabolites
+```{r cor_gm}
+# get expression data for differentially expressed genes
+# tmp_e <- bacteria_counts[match(diff_genes, bacteria_genes$gene_name), c(9, 10, 11, 20, 21, 22)]
+
+# chemotaxis_genes <- names(which(gobp_table[which(rownames(gobp_table) == "GO:0006935"),] != 0))
+# leubio_genes <- names(which(gobp_table[which(rownames(gobp_table) == "GO:0009098"),] != 0))
+# a1 <- bacteria_counts[match(chemotaxis_genes, bacteria_genes$gene_name), c(9, 10, 11, 20, 21, 22)]
+# a2 <- bacteria_counts[match(leubio_genes, bacteria_genes$gene_name), c(9, 10, 11, 20, 21, 22)]
+# tmp_e <- rbind(a1, a2)
+# tmp_g <- c(chemotaxis_genes, leubio_genes)
+# tmp_o <- c(rep(1, length(chemotaxis_genes)), rep(2, length(leubio_genes)))
+tmp_e <- bacteria_counts[, c(9, 10, 11, 20, 21, 22)]
+tmp_g <- bacteria_genes$gene_name
+tmp_o <- rep(1, nrow(bacteria_genes))
+
+# get differential metabolite abundance for mets of interest
+x3 <- c(which(res2a$adj.P.Val < 0.05),
+        which(res2b$adj.P.Val < 0.05))#,
+
+a1 <- which(groups == "AP_Mmb_EHEC")
+a2 <- which(groups == "AP_Mmb")
+a3 <- which(groups == "AP_Hmb_EHEC")
+a4 <- which(groups == "AP_Hmb")
+
+tmp_m <- new_norm_data[x3, c(a1, a2, a3, a4)]
+# tmp_m <- new_norm_data[, c(a1, a2, a3, a4)]
+
+# compare gene expression floating bacteria mouse with metabolites in infection
+# then get average correlation
+correlation_gm <- vector(mode = "list", length = nrow(tmp_e))
+h_tests <- combn(x = seq(4, 7), m = 3)
+m_tests <- combn(x = seq(1, 4), m = 3)
+h_no <- seq(13, 15)
+m_no <- seq(5, 7)
+for (i in seq(1, nrow(tmp_e))) {
+  y1 <- tmp_e[i, c(4, 5, 6)] # <-- mouse mm, floating bacteria
+  y2 <- tmp_e[i, c(1, 2, 3)] # <-- human mm, floating bacteria
+  
+  r2 <- apply(tmp_m[, c(5, 6, 7)], 1, function(y) cor(y, y1)) # <-- correlation to no infection, mouse
+  r4 <- apply(tmp_m[, c(13, 14, 15)], 1, function(y) cor(y, y2)) # <-- correlation to no infection, human
+
+  hcor <- matrix(0, ncol = ncol(h_tests), nrow = length(x3))
+  mcor <- matrix(0, ncol = ncol(m_tests), nrow = length(x3))
+  
+  for (j in seq(1, ncol(h_tests))) {
+    hcor[, j] <- apply(tmp_m[, h_tests[, j]], 1, function(z) cor(z, y1))
+  }
+  
+  for (k in seq(1, ncol(m_tests))) {
+    mcor[, k] <- apply(tmp_m[, m_tests[, k]], 1, function(z) cor(z, y1))
+  }
+    
+  correlation_gm[[i]] <- data_frame(gene = rep(rep(tmp_g[i], length(x3)), 4),
+                                    metabolites = rep(new_cpd_data$ref[x3], 4),
+                                    mean_correlation = c(rowMeans(mcor), 
+                                                         r2,
+                                                         rowMeans(hcor),
+                                                         r4),
+                                    correlation_group = c(rep("Mmb + EHEC", length(x3)),
+                                                          rep("Mmb", length(x3)),
+                                                          rep("Hmb + EHEC", length(x3)),
+                                                          rep("Hmb", length(x3))),
+                                    plot_order = rep(rep(tmp_o[i], length(x3)), 4))
+                                    # mouse_correlation_ehec = ,
+                                    # mouse_correlation_no = r2,
+                                    # human_correlation_ehec = rowMeans(hcor),
+                                    # human_correlation_no = r4)
+}
+correlation_gm <- bind_rows(correlation_gm)
+
+correlation_gm %>% 
+  dplyr::filter(., correlation_group == "Mmb + EHEC" | correlation_group == "Hmb + EHEC") %>%
+  # dplyr::filter(., correlation_group == "Hmb + EHEC") %>%
+  # dplyr::filter(., gene %in% g1) %>%
+  # dplyr::filter(., abs(mean_correlation) > 0.7) %>%
+  dplyr::filter(., abs(mean_correlation) > 0.6) %>%
+  ggplot() + 
+  geom_tile(aes(y = fct_reorder(gene, plot_order), x = metabolites, fill = mean_correlation), color = "white") + 
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "red") +
+  # coord_equal() + 
+  facet_grid(~ correlation_group) + 
+  theme_bw() +
+  theme(#axis.text.y = element_blank(),
+        axis.text.y = element_text(size = 12, color = "black"),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        panel.grid = element_blank())
+
+# which genes change correlation with metabolites in the 2 infected groups?
+up_mouse <- correlation_gm %>% 
+  dplyr::mutate(., pair = paste(gene, " :: ", metabolites, sep = "")) %>%
+  dplyr::filter(., correlation_group == "Mmb + EHEC", mean_correlation > 0.75) %>%
+  dplyr::select(., pair) %>%
+  as.matrix
+  
+down_human <- correlation_gm %>% 
+  dplyr::mutate(., pair = paste(gene, " :: ", metabolites, sep = "")) %>%
+  dplyr::filter(., correlation_group == "Hmb + EHEC", mean_correlation < 0) %>%
+  dplyr::select(., pair) %>%
+  as.matrix
+
+down_mouse <- correlation_gm %>% 
+  dplyr::mutate(., pair = paste(gene, " :: ", metabolites, sep = "")) %>%
+  dplyr::filter(., correlation_group == "Mmb + EHEC", mean_correlation < 0) %>%
+  dplyr::select(., pair) %>%
+  as.matrix
+  
+up_human <- correlation_gm %>% 
+  dplyr::mutate(., pair = paste(gene, " :: ", metabolites, sep = "")) %>%
+  dplyr::filter(., correlation_group == "Hmb + EHEC", mean_correlation > 0.75) %>%
+  dplyr::select(., pair) %>%
+  as.matrix
+
+opps <- c(intersect(up_mouse, down_human), intersect(down_mouse, up_human))
+# opps <- intersect(up_mouse, down_human)
+
+correlation_gm %>%
+  dplyr::mutate(., pair = paste(gene, " :: ", metabolites, sep = "")) %>%
+  dplyr::filter(., pair %in% opps) %>% 
+  dplyr::filter(., correlation_group == "Mmb + EHEC" | correlation_group == "Hmb + EHEC") %>%
+  dplyr::filter(., abs(mean_correlation) > 0.6) %>%
+  ggplot() + 
+  geom_tile(aes(y = gene, x = metabolites, fill = mean_correlation), color = "white") +
+  # geom_point(aes(x = pair, y = mean_correlation, color = correlation_group)) + 
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "red") +
+  # coord_equal() + 
+  # coord_flip() +
+  facet_grid(~ correlation_group, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank(),
+        # axis.text.y = element_text(size = 12, color = "black"),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        panel.grid = element_blank())
+  
+
+```
+
+
+```{r correlation_enrichment}
+# for all the metabolites, pick a group first, then see which ones are highly correlated with that group and do an enrichment to determine pathways enriched with that metabolite
+
+# correlated with mouse microbial metabolite driven expression
+a1 <- correlation_gm %>% 
+  dplyr::filter(., mean_correlation > 0.8, correlation_group == "Mmb + EHEC") %>% 
+  dplyr::count(., metabolites) 
+
+# correlated with human microbial metabolite driven expression
+a2 <- correlation_gm %>% 
+  dplyr::filter(., mean_correlation > 0.8, correlation_group == "Hmb + EHEC") %>% 
+  dplyr::count(., metabolites) 
+
+mouse_mm <- as.vector(a1$metabolites)
+human_mm <- as.vector(a2$metabolites)
+common_mm <- intersect(mouse_mm, human_mm)
+mouse_mm <- setdiff(mouse_mm, common_mm)
+human_mm <- setdiff(human_mm, common_mm)
+
+# mouse case
+mouse_mm_enr <- vector(mode = "list", lengt = length(mouse_mm))
+for (i in seq(1, length(mouse_mm))) {
+  y1 <- correlation_gm %>% 
+    dplyr::filter(., mean_correlation > 0.8, correlation_group == "Mmb + EHEC", metabolites == mouse_mm[i]) %>% 
+    dplyr::select(., gene) %>% as.matrix
+  
+  query_vector <- matrix(0, ncol = ncol(gobp_tfidf), nrow = 1)
+  query_vector[which(colnames(gobp_tfidf) %in% y1)] <- 1
+  rset <- random_sets(number_sets = 10000, universe_size = ncol(gobp_tfidf), gene_set_size = length(y1))
+  rnd_res <- random_tfidf(random_set = rset, target_tfidf = gobp_tfidf, tfidf_crossprod_mat = gobp_cpm)
+  rnd_res <- lapply(rnd_res, as.matrix)
+  rnd_res <- do.call(cbind, rnd_res)
+  gobp_similarities <- cosine_similarity(x = gobp_tfidf, y = query_vector, tfidf_crossprod_mat = gobp_cpm)
+  prandom <- 1 - res_stats(as.matrix(gobp_similarities), rnd_res)
+  
+  mouse_mm_enr[[i]] <- data_frame(metabolite = rep(mouse_mm[i], length(gobp_similarities)),
+                                  go_id = rownames(gobp_tfidf),
+                                  go_term = gobp$go_term[match(rownames(gobp_tfidf),gobp$goid)],
+                                  cosine_similarity = as.vector(gobp_similarities),
+                                  number_genes_pathway = rowSums(gobp_table[match(rownames(gobp_tfidf),gobp$goid),]),
+                                  probability_random = prandom)
+  
+}
+mouse_mm_enr <- dplyr::bind_rows(mouse_mm_enr)
+
+# human case
+human_mm_enr <- vector(mode = "list", lengt = length(human_mm))
+for (i in seq(1, length(human_mm))) {
+  y1 <- correlation_gm %>% 
+    dplyr::filter(., mean_correlation > 0.8, correlation_group == "Hmb + EHEC", metabolites == human_mm[i]) %>% 
+    dplyr::select(., gene) %>% as.matrix
+  
+  query_vector <- matrix(0, ncol = ncol(gobp_tfidf), nrow = 1)
+  query_vector[which(colnames(gobp_tfidf) %in% y1)] <- 1
+  rset <- random_sets(number_sets = 10000, universe_size = ncol(gobp_tfidf), gene_set_size = length(y1))
+  rnd_res <- random_tfidf(random_set = rset, target_tfidf = gobp_tfidf, tfidf_crossprod_mat = gobp_cpm)
+  rnd_res <- lapply(rnd_res, as.matrix)
+  rnd_res <- do.call(cbind, rnd_res)
+  gobp_similarities <- cosine_similarity(x = gobp_tfidf, y = query_vector, tfidf_crossprod_mat = gobp_cpm)
+  prandom <- 1 - res_stats(as.matrix(gobp_similarities), rnd_res)
+  
+  human_mm_enr[[i]] <- data_frame(metabolite = rep(human_mm[i], length(gobp_similarities)),
+                                  go_id = rownames(gobp_tfidf),
+                                  go_term = gobp$go_term[match(rownames(gobp_tfidf),gobp$goid)],
+                                  cosine_similarity = as.vector(gobp_similarities),
+                                  number_genes_pathway = rowSums(gobp_table[match(rownames(gobp_tfidf),gobp$goid),]),
+                                  probability_random = prandom)
+  
+}
+human_mm_enr <- dplyr::bind_rows(human_mm_enr)
+
+```
+
+## Future directions
+- Analyzing the host side of transcriptomics
+- ConDDR for identification for tolerance inducing compounds based on host data
+- Metabolite selection for _treatment_ of chips

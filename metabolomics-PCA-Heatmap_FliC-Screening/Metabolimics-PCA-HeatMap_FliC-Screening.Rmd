@@ -1,0 +1,246 @@
+---
+title: "Metabolimics-PCA-HeatMap_FliC-Screening"
+author: "Alessio Tovaglieri"
+date: "7/9/2018"
+output: html_document
+---
+#setup
+```{r setup, include=FALSE}
+rm(list=ls())
+library(cluster)
+library(ggfortify)
+library(gplots)
+library(cowplot)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(reshape)
+library(tidyr)
+library(data.table)
+library(gridExtra)
+library(grid)
+library(ggpubr)
+```
+
+```{r meta_CuratedList_data_load, results=FALSE, include=TRUE, fig.width= 12,fig.height=14}
+meta_LIST <- read_csv("./data/List_Curated_Metab.csv")
+meta_DE <- read_csv("./data/DE_H_vs_M.csv")
+meta_COUNT <- read_csv("./data/t_norm_log_abundance.csv")
+meta_sTOg <- read_csv("./data/Sample_TO_group.csv")
+auc <- read_csv("./data/FliC_AUC.csv")
+auc_AV <- read_csv("./data/FliC_AUC_average.csv")
+
+meta_DE = meta_DE %>% select(.,-X1) %>% rename(.,c("MetabID"="id_METAB"))
+meta_COUNT=meta_COUNT %>% rename(.,c("MetaID"="id_METAB"))
+```
+
+
+
+#make a plot with metabolites from curated list, with average,dot and sem
+```{r meta_barplot_CuratedList_dot, results=FALSE, include=TRUE, cache=FALSE}
+#remember that count norm log is logaritmic
+
+#meta_COUNT_b=meta_COUNT %>% mutate_if(is.numeric,exp)
+meta_COUNT_LIST=meta_COUNT %>% inner_join(.,meta_LIST,by=c("id_METAB"))
+
+temp_meta_COUNT_LIST_PLOT=meta_COUNT_LIST %>%   mutate_if(is.numeric,exp) %>% select(.,'3317A','3318A','3319A','3320A','3321A','3322A','3325A','3326A',id_METAB,name_FINAL) %>% gather(.,key=sample,value=count,-id_METAB,-name_FINAL) %>% inner_join(x = .,y = meta_sTOg,by =  c( "sample")) 
+
+#calculate the average f Mmb for each metabolite so than you can use it to normalise and calculate Hmm vs Mmm for each metabolit for the plot
+meta_COUNT_LIST_PLOT_average=temp_meta_COUNT_LIST_PLOT %>% group_by(group,id_METAB,name_FINAL) %>% summarise(.,count_mean=mean(count)) %>% spread(.,key=group,value=count_mean) %>% select(., id_METAB,name_FINAL,Mmb_stock_100) %>% rename(.,c("Mmb_stock_100"="Mmb_average"))
+
+#if the average is zero substitute with the minimum count ever detected in all metabolites
+#define mimnimun to solve problem when te read is zero
+minimum=meta_COUNT %>% select(.,-id_METAB) %>%  mutate_if(is.numeric,exp)
+minimum=min(minimum)
+meta_COUNT_LIST_PLOT_average=meta_COUNT_LIST_PLOT_average %>% mutate(Mmb_average=ifelse(Mmb_average==0,minimum,Mmb_average))
+
+
+meta_COUNT_LIST_PLOT=temp_meta_COUNT_LIST_PLOT %>% inner_join(.,meta_COUNT_LIST_PLOT_average, by=c("name_FINAL","id_METAB")) %>% filter(.,group=="Hmb_stock_100") %>% mutate(.,HmmVSMmm_fc=count/Mmb_average) %>% select(.,-count,-Mmb_average) %>% mutate_if(is.numeric,log2) %>% arrange(.,desc(HmmVSMmm_fc)) %>% mutate(.,meta_fillcol=ifelse(HmmVSMmm_fc>0,"dark red","dark blue")) 
+#add artififcially rows with DMSO and PAC, both with a value of zero
+meta_COUNT_LIST_PLOT=meta_COUNT_LIST_PLOT %>% union(.,tibble(id_METAB= c("u","u","u","u","u","u"),name_FINAL=c("PAC","PAC","PAC","DMSO","DMSO","DMSO"),sample= c("u","u","u","u","u","u"),group= c("u","u","u","u","u","u"),name= c("u","u","u","u","u","u"),HmmVSMmm_fc= c(0,0,0,0,0,0),meta_fillcol= c("u","u","u","u","u","u") ) ) %>% mutate(.,HmmVSMmm_fc=ifelse(HmmVSMmm_fc==0,NA,HmmVSMmm_fc))
+
+positions = meta_COUNT_LIST_PLOT %>% group_by(.,name_FINAL) %>% summarise(HmmVSMmm_fc=mean(HmmVSMmm_fc)) %>% arrange(desc(HmmVSMmm_fc)) %>% pull(var = name_FINAL) %>% unique(.)
+
+p1=ggplot(data=meta_COUNT_LIST_PLOT,aes(x=name_FINAL, y=HmmVSMmm_fc), group=name)+
+geom_boxplot(aes(fill=meta_fillcol,colour=meta_fillcol),alpha=0.7)+
+scale_fill_manual(values=c("blue","red3","yellow"))+
+  scale_colour_manual(values=c("dark  blue","red4","yellow"))+
+
+geom_jitter(position=position_jitter(width=0.15, height=0), alpha=0.6,size=0.6,color=meta_COUNT_LIST_PLOT$meta_fillcol)+
+ylab("Hmm vs Mmm (metab. conc. log2 FC)")+
+xlab("")+
+scale_x_discrete(limits = positions, drop=FALSE)+
+geom_hline(yintercept = 0, color = "black", size=0.7)+
+coord_flip()+
+theme_minimal()+
+theme(legend.position="none")+
+theme(axis.text.y = element_text( hjust = 1, size=9,color="black"), axis.title=element_text(size=10,face="bold"),panel.grid.minor = element_blank())
+p1
+
+
+
+
+
+
+
+
+```
+
+
+#make a plot with auc from curated list, with average,dot and sem
+```{r auc_CuratedList, results=FALSE, include=TRUE, cache=FALSE }
+#auc_PD=auc %>% filter(.,c_num==29 | c_num==30) %>% rename(.,c("c_name"="name_FINAL"))
+#meta_COUNT_LIST_PLOT=meta_COUNT_LIST_PLOT
+auc_LIST_PLOT=auc %>% rename(.,c("group"="auc_group","c_name"="name_FINAL"))   %>% filter(.,pathogen !=0) %>% filter(.,c_num !=31) %>% inner_join(.,unique(select(meta_COUNT_LIST_PLOT,name_FINAL)),by=c("name_FINAL"),copy =
+FALSE) %>% inner_join(.,select(auc_AV,c_name,auc_norm_pval,auc_up_down_ns),by=c("name_FINAL"="c_name")) %>% filter(., auc_up_down_ns==0 | auc_up_down_ns==-1 | auc_up_down_ns==1) %>% mutate(.,auc_fillcol=ifelse(auc_up_down_ns==1,"dark red","grey60")) %>% mutate(.,auc_fillcol=ifelse(auc_up_down_ns==-1,"dark blue",auc_fillcol))
+
+
+positions = meta_COUNT_LIST_PLOT %>% group_by(.,name_FINAL) %>% summarise(HmmVSMmm_fc=mean(HmmVSMmm_fc)) %>% arrange(desc(HmmVSMmm_fc)) %>% pull(var = name_FINAL) %>% unique(.)
+
+p2=ggplot(data=auc_LIST_PLOT,aes(x=name_FINAL, y=auc_norm), group=name_FINAL)+
+geom_boxplot(aes(fill=factor(auc_fillcol),colour=factor(auc_fillcol)),alpha=0.7)+
+scale_fill_manual(values=c("blue","red3","grey92"))+
+scale_colour_manual(values=c("dark blue","red4","grey85"))+
+geom_jitter(position=position_jitter(width=0.15, height=0), alpha=0.6,size=0.6,colour=auc_LIST_PLOT$auc_fillcol)+
+ylab("FliC-lux (AUC/AUC DMSO)")+
+xlab("")+
+scale_x_discrete(limits = positions)+
+scale_y_continuous(limits=c(0.5,1.7),breaks=c(0.5,0.75,1,1.25,1.5))+
+coord_flip()+
+theme_minimal()+
+theme(legend.position="none")+
+geom_hline(yintercept = 1, color = "black", size=0.7)+
+theme(axis.text.y = element_text( hjust=0.5, angle=0, size=9,color="black"), axis.title=element_text(size=10,face="bold"),panel.grid.minor = element_blank())
+
+# panel.grid.major = element_blank(),
+#     panel.grid.minor = element_blank(),
+#     panel.border = element_blank(),
+#     panel.background = element_blank())
+
+p2
+
+
+```
+
+```{r save_fig, results=FALSE, include=TRUE,fig.width= 9,fig.height=6}
+ #save
+ggarrange(p1, p2,ncol = 2, nrow = 1)
+ggsave <- ggplot2::ggsave; body(ggsave) <- body(ggplot2::ggsave)[-2]
+g <- arrangeGrob(p1, p2, nrow=1,ncol=2) #generates g
+ggsave(filename = g, path="./fig",device="svg",width = 9,height = 6, bg = "transparent")
+#now rename the file
+file.rename("./fig/gtable[arrange]", "./fig/Metab-Comp.svg")
+```
+
+
+
+
+
+
+```{r meta_all_heatamap, results=FALSE, include=TRUE, fig.width= 18,fig.height=21}
+temp_meta_COUNT=inner_join(x = meta_COUNT,y = meta_DE,by =  c( "id_METAB"))  %>% column_to_rownames(.,var = 'id_METAB') %>% select(.,'3317A','3318A','3319A','3320A','3321A','3322A','3325A','3326A')
+
+#renema columns with a name with identifier from meta_sTOg file
+colnames(temp_meta_COUNT)=filter(meta_sTOg,sample==colnames(temp_meta_COUNT)) %>% pull(.,name)
+
+#re order columns here so the dendogram starts with pre-ferm!!!
+
+temp_meta_COUNT=temp_meta_COUNT %>% select(.,Pre_3325A,Pre_3326A,Hmb_3317A,Hmb_3318A,Hmb_3319A,Mmb_3320A,Mmb_3321A,Mmb_3322A) %>% dplyr::rename(.,P_25=Pre_3325A,P_26=Pre_3326A,H_17=Hmb_3317A,H_18=Hmb_3318A,H_19=Hmb_3319A,M_20=Mmb_3320A,M_21=Mmb_3321A,M_22=Mmb_3322A)
+
+
+h_data=NULL
+#save the figure you will generate
+#set width and hight of the figure to save
+w=3.5
+h=2.5
+
+while (!is.null(dev.list()))  dev.off()
+svglite::svglite(file = "./fig/AllMetabHeatMap.svg",width = w, height = h,bg = "transparent",pointsize = 8)
+h_data=data.matrix(temp_meta_COUNT,rownames.force = NA)
+
+
+
+
+
+
+## Get palette colours
+my_palette <- colorRampPalette(c("white","light blue", "dark blue"))(n = 20)
+
+
+
+#make row dendro
+data.r = scale(t(h_data)) #scale column data for row dendro
+dendro.r <- hclust(as.dist(1-cor(data.r, method="pearson")), method="complete")
+
+#par(oma=c(1,4,1,8))
+#where par(mar=c(bottom,left,top,right))
+p=heatmap.2(h_data,
+          #col=,
+          trace="none", 
+          col=my_palette, 
+          #main=paste("Metab. stock all sig. better dendro n=",nrow(h_data)),
+          #margins=c(1,1), #increase margin
+          #labRow = FALSE,
+          scale="row",
+          density.info="none",
+          ColSideColors = c("grey","grey","red","red","red","dark blue","dark blue","dark blue"),
+          #lhei = c(0.8,8),
+          cexRow = 1.3,
+          cexCol = 1.2,
+          lwid = c(1.5, 4),
+          Rowv=as.dendrogram(dendro.r), 
+          labRow = FALSE
+          
+          )
+dev.off()
+
+```
+
+
+```{r pca_signifolny, results=FALSE, include=TRUE,fig.width=3.5,fig.height=1.7}
+
+temp_meta_COUNT=inner_join(x = meta_COUNT,y = meta_DE,by =  c( "id_METAB"))  %>%  select(.,id_METAB,'3317A','3318A','3319A','3320A','3321A','3322A','3325A','3326A') %>% dplyr::rename(.,PreFerm_25='3325A',PreFerm_26='3326A',HMmet_17='3317A',HMmet_18='3318A',HMmet_19='3319A',MMmet_20='3320A',MMmet_21='3321A',MMmet_22='3322A')
+
+t_temp_meta_COUNT=t(dplyr::select(temp_meta_COUNT,-id_METAB))
+
+df_pca <- prcomp(t_temp_meta_COUNT)
+df_out <- as.data.frame(df_pca$x)
+df_out$group <- sapply( strsplit(as.character(row.names(t_temp_meta_COUNT)), "_"), "[[", 1 )
+head(df_out)
+
+percentage <- round(df_pca$sdev / sum(df_pca$sdev) * 100, 2)
+percentage <- paste( colnames(df_out), "(", paste( as.character(percentage), "%", ")", sep="") )
+
+p<-ggplot(df_out,aes(x=PC1,y=PC2,color=group,shape=group ))+
+  geom_point(size=2,alpha=0.7)+ 
+  scale_colour_manual(values=c(MMmet="dark blue",HMmet="red",PreFerm="grey"))+
+
+  xlab(percentage[1]) + 
+  ylab(percentage[2])+
+  #stat_ellipse(type = "norm", linetype = 2)+
+  theme(
+    plot.title = element_text(hjust = 0.5,colour="black"),
+    axis.text=element_text(size=8,colour="black"), 
+    axis.title=element_text(size=8,colour="black"),
+    panel.background = element_rect(fill = "transparent"),
+    plot.background = element_rect(fill = "transparent", colour = NA),
+    legend.title=element_blank(),
+    legend.text = element_text(size=8,colour="black")
+
+    ) 
+p
+
+```
+
+```{r, save_fig ,results=FALSE, include=FALSE}
+#figure size:
+w=4
+h=3
+
+#save 
+ggsave(p, device = "svg",filename = "./fig/MetabPCA.svg",width = w, height = h, bg = "transparent")
+
+
+```

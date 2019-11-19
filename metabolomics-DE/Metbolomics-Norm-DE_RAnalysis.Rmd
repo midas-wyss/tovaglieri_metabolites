@@ -1,0 +1,283 @@
+---
+title: "Metabolomics-Norm-DE"
+author: "Alessio Tovaglieri"
+date: "10/12/2018"
+output: html_document
+---
+```{r,results=FALSE, include=FALSE}
+rm(list=ls())
+
+library(readr)
+library(dplyr)
+library(gplots)
+library(RColorBrewer)
+library(rmarkdown)
+library(ggplot2)
+library(data.table)
+library("pheatmap")
+library("DESeq2")
+library(limma)
+library(readxl)
+library(pcaMethods)
+library(metabolomics)
+library("tibble")
+
+#functions
+convert_num_to_df <- function (num)
+{names=rownames(num)
+temp_num=as.data.table(num)
+row.names(temp_num)=names
+return(temp_num)}
+
+```
+
+Directories and files 
+
+
+```{r setup, include=FALSE}
+abundance=read_csv("./data/metabolites_abundance_raw.csv")
+data_meta=read_csv("./data/metabolites_ID.csv",na = "")
+
+temp_abundance=abundance
+
+temp_abundance=column_to_rownames(temp_abundance,var = 'Sample')
+
+#Using metabolomics package that does not feed on tydy datasets...
+#LOG TRANSFORM (needed before normalization)
+temp_log_abundance=NULL
+#run LogTransform
+temp_log_abundance=LogTransform(temp_abundance, base = exp(1),
+saveoutput = FALSE, outputname = "log_abundance")
+log_abundance=as_data_frame(temp_log_abundance$output)
+log_abundance=add_column(log_abundance,Sample=temp_log_abundance$samples,.before = 1)
+temp_log_abundance=NULL
+temp_abundance=NULL
+
+
+#NORMALISE
+temp_log_abundance=NULL
+#move column to rownames to feed it to normnalize function
+temp_log_abundance=column_to_rownames(log_abundance,var = 'Sample')
+#run Normalise
+temp_norm_log_abundance=Normalise(temp_log_abundance, method = c("median"), saveoutput = FALSE)
+norm_log_abundance=as_data_frame(temp_norm_log_abundance$output)
+norm_log_abundance=add_column(norm_log_abundance,Sample=temp_norm_log_abundance$samples,.before = 1)
+temp_norm_log_abundance=NULL
+temp_log_abundance=NULL
+
+#Create a transposed version of the table 
+t_log_abundance=NULL
+t_log_abundance=log_abundance %>% select(-Group) %>% tidyr::gather(MetaID,valname,-Sample) %>% tidyr::spread(Sample,valname)
+
+
+```
+#plot median before and after normalization
+```{r meta_stock_norm, results=FALSE, include=TRUE}
+
+# Check distributions of RAW and NORMALIZED samples using BOXPLOTS
+
+#BOXPLOT OF RAW DATA
+temp_t_log_abundance= t_log_abundance %>% remove_rownames() %>% column_to_rownames("MetaID")
+
+boxplot(temp_t_log_abundance, xlab="", ylab="Log2 counts per million",las=2,par(mar=c(8,8,4,2)),staplewex = 1)
+title("Boxplots of raw data")
+temp_t_log_abundance=NULL
+
+#BOXPLOT OF NORMALISED DATA
+#Create a transposed version of the table for boxplot
+t_norm_log_abundance=NULL
+t_norm_log_abundance=norm_log_abundance %>% select(-Group) %>% tidyr::gather(MetaID,valname,-Sample) %>% tidyr::spread(Sample,valname)
+
+temp_t_norm_log_abundance= t_norm_log_abundance %>% remove_rownames() %>% column_to_rownames("MetaID")
+#save normalised data transposed version
+write.csv(t_norm_log_abundance, file="./res/t_norm_log_abundance.csv")
+boxplot(temp_t_norm_log_abundance, xlab="", ylab="Log2 counts per million",las=2,par(mar=c(8,8,4,2)),staplewex = 1)
+title("Boxplots of normalized data")
+temp_t_norm_log_abundance=NULL
+
+
+
+```
+
+
+
+
+
+
+#dendogram
+```{r meta_stock_dendo, results=FALSE, include=TRUE}
+#change back to rownames to fgeed to dendogram
+temp_norm_log_abundance=NULL
+temp_norm_log_abundance=norm_log_abundance
+temp_norm_log_abundance=column_to_rownames(temp_norm_log_abundance,var='Sample')
+Dendrogram(as.data.frame(temp_norm_log_abundance),distmethod = "manhattan", aggmethod = "ward", main = "Dendrogram all metab norm", cex = 0.4)
+temp_norm_log_abundance=NULL
+```
+
+
+##CALCULATE AND PLOT PCA USING ALL METABOLITES after norm.
+
+```{r meta_stock_pca, results=FALSE, include=TRUE}
+#assign values to needed variables
+log.ir <- norm_log_abundance[,-c(1,2)]
+ir.species <- norm_log_abundance[, 2]
+
+ir.pca <- prcomp(log.ir,
+                 center = TRUE,
+                 scale. = TRUE) 
+
+# extract PCA
+PCA=ir.pca$x
+
+PCA=convert_num_to_df(PCA)
+#add back a group column
+PCA$Group=norm_log_abundance$Group
+
+
+#extract PCA summary
+s=summary(ir.pca)
+summary_variance=s$importance
+summary_variance=convert_num_to_df(summary_variance)
+#extract percent variation of the first 2 axis PC1 andPC2
+percentVar <- round(100*as.numeric(summary_variance[2,1:2]))
+
+p=ggplot(PCA, aes(PC1, PC2, color=Group, shape=Group)) +
+  geom_point(size=5) +
+  theme_classic() +
+  ggtitle("PCA all metabolites (norm)") +
+  theme(plot.title = element_text(hjust = 0.5),axis.text=element_text(size=10),legend.text = element_text(size=10),legend.title = element_text(size=10), axis.title=element_text(size=10) )+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) 
+p
+
+
+# plot method
+plot(ir.pca, type = "l")
+
+#remove useless variables
+log.ir=NULL
+ir.species=NULL
+ir.pca=NULL
+s=NULL
+summary_variance=NULL
+percentVar=NULL
+p=NULL
+PCA=NULL
+```
+
+#calculate DE: Hmb vs Pre-ferm and Mmb vs Pre-ferm 
+
+```{r meta_stock_de, results=FALSE, include=TRUE}
+
+#define mydata
+mydata=norm_log_abundance[,-c(1,2)]
+
+#define design table
+mydesign=NULL
+#group H
+mydesign$GroupH[norm_log_abundance$Group=="Hmb_stock_100"]=1
+mydesign$GroupH[norm_log_abundance$Group!="Hmb_stock_100"]=0
+#group M
+mydesign$GroupM[norm_log_abundance$Group=="Mmb_stock_100"]=1
+mydesign$GroupM[norm_log_abundance$Group!="Mmb_stock_100"]=0
+#group P
+mydesign$GroupP[norm_log_abundance$Group=="Pre-ferm_100"]=1
+mydesign$GroupP[norm_log_abundance$Group!="Pre-ferm_100"]=0   
+mydesign=as.data.table(mydesign)
+
+#lmfit 
+fit <- lmFit(t(mydata), mydesign)  
+contrast.matrix=makeContrasts(GroupH - GroupP, GroupM - GroupP, GroupH - GroupM, levels = mydesign)
+
+fit2 = contrasts.fit(fit, contrast.matrix)
+fit2 = eBayes(fit2)
+DE_H_vs_P = topTable(fit2, coef=1, adjust="fdr", lfc = log2(1.5), p.value = 0.05,number = 5073)
+DE_M_vs_P = topTable(fit2, coef=2, adjust="fdr", lfc = log2(1.5), p.value = 0.05,number = 5073)
+
+
+#convert to tibble data frame
+DE_H_vs_P=as_data_frame(DE_H_vs_P)
+DE_M_vs_P=as_data_frame(DE_M_vs_P)
+
+#put back the row names as a column
+DE_H_vs_P=rownames_to_column(DE_H_vs_P,var='MetabID')
+DE_M_vs_P=rownames_to_column(DE_M_vs_P,var='MetabID')
+
+#add 2 new columns with names and putative names
+DE_H_vs_P=left_join(DE_H_vs_P,data_meta[,1:3],by = c("MetabID", "MetabID"))
+DE_M_vs_P=left_join(DE_M_vs_P,data_meta[,1:3],by = c("MetabID", "MetabID"))
+
+
+```
+
+#define a variable with the union of the UPREGULATED metabolites in H vs P and M vs P
+
+```{r meta_stock_upreg, results=FALSE, include=TRUE}
+
+
+names_DE_H_vs_P_fcPOS=DE_H_vs_P[DE_H_vs_P$logFC>log2(1.5),]
+names_DE_M_vs_P_fcPOS=DE_M_vs_P[DE_M_vs_P$logFC>log2(1.5),]
+
+#do a union of the two names of list and keep only uniques names
+names_H_M_vs_P_fcPOS=NULL
+names_H_M_vs_P_fcPOS=c(names_DE_H_vs_P_fcPOS$MetabID,names_DE_M_vs_P_fcPOS$MetabID)
+names_H_M_vs_P_fcPOS=unique(names_H_M_vs_P_fcPOS)
+#remove variables
+names_DE_H_vs_P_fcPOS=NULL
+names_DE_M_vs_P_fcPOS=NULL
+fit=NULL
+fit2=NULL
+mydata=NULL
+mydesign=NULL
+contrast.matrix=NULL
+```
+
+#feed the subset of norm_log_abundance (the one woth metabolites increased in H and M compared tor Pre) to the linearized model to calculate DE again
+
+```{r meta_stock_de_subs, results=FALSE, include=TRUE}
+
+mydata=norm_log_abundance[,names(norm_log_abundance) %in% names_H_M_vs_P_fcPOS]
+
+
+#define design table
+
+#group H
+mydesign$GroupH[norm_log_abundance$Group=="Hmb_stock_100"]=1
+mydesign$GroupH[norm_log_abundance$Group!="Hmb_stock_100"]=0
+#group M
+mydesign$GroupM[norm_log_abundance$Group=="Mmb_stock_100"]=1
+mydesign$GroupM[norm_log_abundance$Group!="Mmb_stock_100"]=0
+#group P
+mydesign$GroupP[norm_log_abundance$Group=="Pre-ferm_100"]=1
+mydesign$GroupP[norm_log_abundance$Group!="Pre-ferm_100"]=0   
+mydesign=as.data.table(mydesign)
+
+#lmfit 
+fit <- lmFit(t(mydata), mydesign)  
+contrast.matrix=makeContrasts(GroupH - GroupP, GroupM - GroupP, GroupH - GroupM, levels = mydesign)
+
+fit2 = contrasts.fit(fit, contrast.matrix)
+fit2 = eBayes(fit2)
+DE_H_vs_M_RunOnPOSMetabOnly = topTable(fit2, coef=3, adjust="fdr", lfc = log2(1.5), p.value = 0.05,number = 5073)
+
+#save the DE tables adding the metabolites name and put name info
+#convert to tibble data frame
+DE_H_vs_M_RunOnPOSMetabOnly=as_data_frame(DE_H_vs_M_RunOnPOSMetabOnly)
+#put back the row names as a column
+DE_H_vs_M_RunOnPOSMetabOnly=rownames_to_column(DE_H_vs_M_RunOnPOSMetabOnly,var='MetabID')
+#add 2 new columns with names and putative names
+DE_H_vs_M_RunOnPOSMetabOnly=left_join(DE_H_vs_M_RunOnPOSMetabOnly,data_meta[,1:3],by = c("MetabID", "MetabID"))
+write.csv(DE_H_vs_M_RunOnPOSMetabOnly, file="./res/DE_H_vs_M.csv")
+
+
+#remove variables
+names_DE_H_vs_P_fcPOS=NULL
+names_DE_M_vs_P_fcPOS=NULL
+fit=NULL
+mydata=NULL
+mydesign=NULL
+contrast.matrix=NULL
+```
+
+
+
